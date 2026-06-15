@@ -134,7 +134,7 @@ session only. Set `ai_send_context = false` to never send this context.
 ```bash
 cargo build        # compile
 cargo run          # run the TUI
-cargo test         # run all tests (63 tests)
+cargo test         # run all tests (82 tests)
 cargo clippy       # lint
 cargo fmt          # format
 ```

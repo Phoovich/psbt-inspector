@@ -48,15 +48,26 @@ pub fn load_config() -> Result<(Config, Vec<String>), ConfigError> {
     let (mut config, mut warnings) = load_from_path(config_path())?;
     apply_env_overrides(&mut config);
 
-    if parse_network(&config.network).is_none() {
-        warnings.push(format!(
-            "config: network \"{}\" is not recognised — using testnet",
-            config.network
-        ));
-        config.network = "testnet".into();
+    if let Some(warning) = validate_network(&mut config) {
+        warnings.push(warning);
     }
 
     Ok((config, warnings))
+}
+
+/// Validates `config.network`, resetting it to `"testnet"` and returning a
+/// startup warning if it is not a recognised network (S7) — never silently
+/// falls back to an unexpected network.
+fn validate_network(config: &mut Config) -> Option<String> {
+    if parse_network(&config.network).is_some() {
+        return None;
+    }
+    let warning = format!(
+        "config: network \"{}\" is not recognised — using testnet",
+        config.network
+    );
+    config.network = "testnet".into();
+    Some(warning)
 }
 
 /// Returns `~/.config/psbt-inspector/config.toml`.
@@ -284,6 +295,68 @@ mod tests {
     #[test]
     fn parse_network_rejects_empty_string() {
         assert!(parse_network("").is_none());
+    }
+
+    // ─── validate_network (S7) ───────────────────────────────────────────────
+
+    #[test]
+    fn validate_network_warns_and_resets_on_invalid_value() {
+        let mut config = Config {
+            network: "minnet".into(),
+            ..Config::default()
+        };
+        let warning = validate_network(&mut config).expect("should warn");
+        assert!(warning.contains("minnet"), "warning: {warning}");
+        assert_eq!(config.network, "testnet");
+    }
+
+    #[test]
+    fn validate_network_is_silent_on_valid_value() {
+        let mut config = Config {
+            network: "signet".into(),
+            ..Config::default()
+        };
+        assert!(validate_network(&mut config).is_none());
+        assert_eq!(config.network, "signet");
+    }
+
+    // ─── S5: config file permission warning ─────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_permissions_produce_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("psbt_inspector_cfg_perm_loose");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "api_key = \"x\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (_, warnings) = load_from_path(path).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("readable by other")),
+            "warnings: {warnings:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_permissions_produce_no_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("psbt_inspector_cfg_perm_strict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "api_key = \"x\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (_, warnings) = load_from_path(path).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

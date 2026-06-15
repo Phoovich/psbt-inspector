@@ -52,6 +52,36 @@ pub enum BuilderFocus {
     Pubkey2,
 }
 
+/// What `start_ai_query` should do about sending PSBT/multisig context,
+/// given whether a PSBT/multisig is loaded, the `ai_send_context` config
+/// flag, and any prior session consent decision (S6).
+#[derive(Debug, PartialEq)]
+enum ConsentDecision {
+    /// Ask the user for consent before sending anything.
+    Prompt,
+    /// Send the built context along with the question.
+    Send,
+    /// Send the question without context (no consent needed).
+    Withhold,
+}
+
+/// Pure decision table for the S6 consent flow. `consent` is `None` until
+/// the user answers the first prompt of the session.
+fn consent_decision(
+    has_context: bool,
+    send_context_cfg: bool,
+    consent: Option<bool>,
+) -> ConsentDecision {
+    if !has_context || !send_context_cfg {
+        return ConsentDecision::Withhold;
+    }
+    match consent {
+        None => ConsentDecision::Prompt,
+        Some(true) => ConsentDecision::Send,
+        Some(false) => ConsentDecision::Withhold,
+    }
+}
+
 pub struct AppState {
     active_tab: Tab,
     // Inspector
@@ -378,18 +408,15 @@ impl AppState {
 
         // S6: ask for session-level consent before the first context-bearing
         // request. `ai_send_context = false` skips straight to "no context".
-        if has_context && self.config.ai_send_context && self.ai_consent.is_none() {
-            self.ai_consent_pending = true;
-            return;
-        }
-
-        let send_context =
-            has_context && self.config.ai_send_context && self.ai_consent == Some(true);
-        let context = if send_context {
-            self.ai_context.clone()
-        } else {
-            String::new()
-        };
+        let context =
+            match consent_decision(has_context, self.config.ai_send_context, self.ai_consent) {
+                ConsentDecision::Prompt => {
+                    self.ai_consent_pending = true;
+                    return;
+                }
+                ConsentDecision::Send => self.ai_context.clone(),
+                ConsentDecision::Withhold => String::new(),
+            };
 
         self.ai_response.clear();
         self.ai_error = None;
@@ -483,5 +510,147 @@ impl AppState {
                 self.ai_consent_pending,
             );
         }
+    }
+}
+
+// ── Test helpers ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+impl AppState {
+    /// Builds an `AppState` with `Config::default()` and no real config I/O,
+    /// for unit-testing event handling and decision logic in isolation.
+    fn new_for_test() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        AppState {
+            active_tab: Tab::Inspector,
+            psbt_input: String::new(),
+            psbt_state: PsbtState::Empty,
+            pubkey1_input: String::new(),
+            pubkey2_input: String::new(),
+            builder_focus: BuilderFocus::Pubkey1,
+            multisig_state: MultisigState::Empty,
+            config: Config::default(),
+            startup_warnings: Vec::new(),
+            ai_open: false,
+            ai_question_input: String::new(),
+            ai_response: String::new(),
+            ai_loading: false,
+            ai_error: None,
+            ai_client: build_client(),
+            ai_generation: 0,
+            ai_consent: None,
+            ai_consent_pending: false,
+            ai_context: build_context(None, None),
+            tx,
+            rx,
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── H5: S6 consent decision ──────────────────────────────────────────────
+
+    #[test]
+    fn consent_decision_prompts_on_first_context_query() {
+        assert_eq!(consent_decision(true, true, None), ConsentDecision::Prompt);
+    }
+
+    #[test]
+    fn consent_decision_sends_when_consented() {
+        assert_eq!(
+            consent_decision(true, true, Some(true)),
+            ConsentDecision::Send
+        );
+    }
+
+    #[test]
+    fn consent_decision_withholds_when_declined() {
+        assert_eq!(
+            consent_decision(true, true, Some(false)),
+            ConsentDecision::Withhold
+        );
+    }
+
+    #[test]
+    fn consent_decision_withholds_when_opted_out() {
+        assert_eq!(
+            consent_decision(true, false, None),
+            ConsentDecision::Withhold
+        );
+        assert_eq!(
+            consent_decision(true, false, Some(true)),
+            ConsentDecision::Withhold
+        );
+    }
+
+    #[test]
+    fn consent_decision_withholds_when_no_context() {
+        assert_eq!(
+            consent_decision(false, true, None),
+            ConsentDecision::Withhold
+        );
+    }
+
+    // ─── H4: S8 generation counter ────────────────────────────────────────────
+
+    #[test]
+    fn stale_ai_chunk_is_dropped() {
+        let mut app = AppState::new_for_test();
+        app.ai_generation = 2;
+        app.handle_event(AppEvent::AiChunk(1, "stale".into()));
+        assert_eq!(app.ai_response, "");
+        app.handle_event(AppEvent::AiChunk(2, "current".into()));
+        assert_eq!(app.ai_response, "current");
+    }
+
+    #[test]
+    fn stale_ai_done_does_not_clear_loading() {
+        let mut app = AppState::new_for_test();
+        app.ai_generation = 2;
+        app.ai_loading = true;
+        app.handle_event(AppEvent::AiDone(1));
+        assert!(app.ai_loading);
+        app.handle_event(AppEvent::AiDone(2));
+        assert!(!app.ai_loading);
+    }
+
+    #[test]
+    fn stale_ai_error_is_dropped() {
+        let mut app = AppState::new_for_test();
+        app.ai_generation = 2;
+        app.ai_loading = true;
+        app.handle_event(AppEvent::AiError(1, "stale error".into()));
+        assert!(app.ai_loading);
+        assert!(app.ai_error.is_none());
+        app.handle_event(AppEvent::AiError(2, "real error".into()));
+        assert!(!app.ai_loading);
+        assert_eq!(app.ai_error, Some("real error".into()));
+    }
+
+    // ─── S8: double-spawn guard ────────────────────────────────────────────────
+
+    #[test]
+    fn start_ai_query_is_noop_while_loading() {
+        let mut app = AppState::new_for_test();
+        app.ai_loading = true;
+        app.ai_question_input = "question".into();
+        let generation_before = app.ai_generation;
+        app.start_ai_query();
+        assert_eq!(app.ai_generation, generation_before);
+    }
+
+    #[test]
+    fn start_ai_query_is_noop_for_empty_question() {
+        let mut app = AppState::new_for_test();
+        app.ai_question_input = "   ".into();
+        let generation_before = app.ai_generation;
+        app.start_ai_query();
+        assert_eq!(app.ai_generation, generation_before);
+        assert!(!app.ai_loading);
     }
 }

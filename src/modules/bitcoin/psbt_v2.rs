@@ -363,7 +363,7 @@ mod tests {
     use super::*;
     use crate::modules::bitcoin::psbt::{FeeInfo, PsbtError, parse_psbt};
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use bitcoin::{Amount, hashes::Hash};
+    use bitcoin::{Amount, Transaction, absolute::LockTime, hashes::Hash, transaction::Version};
 
     fn push_compact_size(buf: &mut Vec<u8>, n: u64) {
         if n < 0xfd {
@@ -425,6 +425,109 @@ mod tests {
         buf.push(0x00); // separator
 
         buf
+    }
+
+    /// Builds a PSBTv2 with one input carrying `PSBT_IN_NON_WITNESS_UTXO` set
+    /// to `prev_tx`, claiming to spend `claimed_txid:vout`, and one output of
+    /// `output_amount` sats.
+    fn build_v2_psbt_with_non_witness_utxo(
+        prev_tx: &Transaction,
+        claimed_txid: Txid,
+        vout: u32,
+        output_amount: u64,
+    ) -> Vec<u8> {
+        let mut buf = MAGIC.to_vec();
+
+        push_pair(&mut buf, PSBT_GLOBAL_VERSION, &2u32.to_le_bytes());
+        let mut count = Vec::new();
+        push_compact_size(&mut count, 1);
+        push_pair(&mut buf, PSBT_GLOBAL_INPUT_COUNT, &count);
+        push_pair(&mut buf, PSBT_GLOBAL_OUTPUT_COUNT, &count);
+        buf.push(0x00); // separator
+
+        push_pair(
+            &mut buf,
+            PSBT_IN_PREVIOUS_TXID,
+            &consensus::serialize(&claimed_txid),
+        );
+        push_pair(&mut buf, PSBT_IN_OUTPUT_INDEX, &vout.to_le_bytes());
+        push_pair(
+            &mut buf,
+            PSBT_IN_NON_WITNESS_UTXO,
+            &consensus::serialize(prev_tx),
+        );
+        buf.push(0x00); // separator
+
+        push_pair(&mut buf, PSBT_OUT_AMOUNT, &output_amount.to_le_bytes());
+        push_pair(&mut buf, PSBT_OUT_SCRIPT, &[]); // empty script
+        buf.push(0x00); // separator
+
+        buf
+    }
+
+    fn tx_with_one_output(value_sats: u64) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(value_sats),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    // ─── S3 (v2 path): verify_and_extract_prev_output outcomes ───────────────
+
+    #[test]
+    fn psbtv2_non_witness_utxo_verified_matches_value() {
+        let prev_tx = tx_with_one_output(100_000);
+        let txid = prev_tx.compute_txid();
+        let bytes = build_v2_psbt_with_non_witness_utxo(&prev_tx, txid, 0, 90_000);
+
+        let summary = parse_psbt(&STANDARD.encode(&bytes)).unwrap();
+
+        assert_eq!(summary.inputs[0].value, Some(100_000));
+        assert!(matches!(summary.fee, FeeInfo::Known(10_000)));
+        assert!(
+            !summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("does not match"))
+        );
+    }
+
+    #[test]
+    fn psbtv2_non_witness_utxo_mismatch_is_rejected() {
+        let prev_tx = tx_with_one_output(100_000);
+        let fake_txid = tx_with_one_output(999_999).compute_txid();
+        let bytes = build_v2_psbt_with_non_witness_utxo(&prev_tx, fake_txid, 0, 50_000);
+
+        let summary = parse_psbt(&STANDARD.encode(&bytes)).unwrap();
+
+        assert_eq!(summary.inputs[0].value, None);
+        assert!(matches!(summary.fee, FeeInfo::Unknown));
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("does not match")),
+            "warnings: {:?}",
+            summary.warnings
+        );
+    }
+
+    #[test]
+    fn psbtv2_non_witness_utxo_vout_not_found() {
+        let prev_tx = tx_with_one_output(100_000);
+        let txid = prev_tx.compute_txid();
+        // vout 5 doesn't exist on a 1-output tx
+        let bytes = build_v2_psbt_with_non_witness_utxo(&prev_tx, txid, 5, 50_000);
+
+        let summary = parse_psbt(&STANDARD.encode(&bytes)).unwrap();
+
+        assert_eq!(summary.inputs[0].value, None);
+        assert!(matches!(summary.fee, FeeInfo::Unknown));
     }
 
     #[test]

@@ -139,6 +139,26 @@ mod tests {
         assert!(matches!(err, MultisigError::DuplicateKeys));
     }
 
+    // Golden vector for PK1 (secp256k1 G) + PK2 (2G), sorted (PK1 < PK2 so no
+    // swap): OP_2 <PK1> <PK2> OP_2 OP_CHECKMULTISIG, P2WSH on testnet/mainnet.
+    const EXPECTED_WITNESS_SCRIPT_HEX: &str = "52210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982102c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee552ae";
+    const EXPECTED_TESTNET_ADDRESS: &str =
+        "tb1qnwvyc7aw8m7acw3lpgs0lqdlaz0drls8luf72cs5nmn9f0kcghdswkm3a0";
+    const EXPECTED_MAINNET_ADDRESS: &str =
+        "bc1qnwvyc7aw8m7acw3lpgs0lqdlaz0drls8luf72cs5nmn9f0kcghdse7d78q";
+
+    #[test]
+    fn produces_exact_golden_address_and_script() {
+        let testnet = build_multisig(PK1, PK2, Network::Testnet, true).unwrap();
+        assert_eq!(testnet.witness_script_hex, EXPECTED_WITNESS_SCRIPT_HEX);
+        assert_eq!(testnet.address, EXPECTED_TESTNET_ADDRESS);
+        assert_eq!(testnet.descriptor, format!("wsh(multi(2,{},{}))", PK1, PK2));
+
+        let mainnet = build_multisig(PK1, PK2, Network::Bitcoin, true).unwrap();
+        assert_eq!(mainnet.witness_script_hex, EXPECTED_WITNESS_SCRIPT_HEX);
+        assert_eq!(mainnet.address, EXPECTED_MAINNET_ADDRESS);
+    }
+
     #[test]
     fn produces_testnet_p2wsh_address() {
         let info = build_multisig(PK1, PK2, Network::Testnet, true).unwrap();

@@ -76,7 +76,6 @@ mod tests {
         assert!(s.contains("No PSBT"), "got: {}", s);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     fn context_includes_psbt_counts() {
         let psbt = PsbtSummary::fake();
@@ -85,13 +84,25 @@ mod tests {
         assert!(s.contains("2 outputs"), "got: {}", s);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     fn context_includes_fee_when_known() {
         let psbt = PsbtSummary::fake();
         let s = build_context(Some(&psbt), None);
         // fake() has FeeInfo::Known(5_000)
         assert!(s.contains("5000"), "got: {}", s);
+    }
+
+    #[test]
+    fn context_includes_fee_when_invalid() {
+        let mut psbt = PsbtSummary::fake();
+        psbt.fee = FeeInfo::Invalid {
+            input_total: 10_000,
+            output_total: 50_000,
+        };
+        let s = build_context(Some(&psbt), None);
+        assert!(s.contains("INVALID"), "got: {}", s);
+        assert!(s.contains("50000"), "got: {}", s);
+        assert!(s.contains("10000"), "got: {}", s);
     }
 
     #[test]
@@ -108,7 +119,6 @@ mod tests {
         assert!(s.contains("wsh(multi(2,"), "got: {}", s);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     fn context_includes_both_when_both_loaded() {
         let psbt = PsbtSummary::fake();
