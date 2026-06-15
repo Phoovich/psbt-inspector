@@ -15,6 +15,10 @@ pub fn build_context(psbt: Option<&PsbtSummary>, multisig: Option<&MultisigInfo>
             let fee_str = match &s.fee {
                 FeeInfo::Known(sats) => format!("{} sats", sats),
                 FeeInfo::Unknown => "unknown".into(),
+                FeeInfo::Invalid {
+                    input_total,
+                    output_total,
+                } => format!("INVALID (outputs {output_total} sats > inputs {input_total} sats)"),
             };
             parts.push(format!(
                 "PSBT: {} inputs, {} outputs, fee: {}, signing: {}/{}",

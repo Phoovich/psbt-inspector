@@ -1,6 +1,9 @@
 use crate::event::AppEvent;
 use crate::modules::{
-    ai::{client::ask, context::build_context},
+    ai::{
+        client::{ask, build_client},
+        context::build_context,
+    },
     bitcoin::{
         multisig::{MultisigInfo, build_multisig},
         psbt::{PsbtSummary, parse_psbt},
@@ -10,12 +13,15 @@ use crate::modules::{
 };
 use crate::tui::Tui;
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Tabs};
-use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Cap on pasted PSBT input (S9) — a multi-MB paste would otherwise be
+/// re-wrapped/decoded on every keystroke with no benefit to the user.
+const MAX_PSBT_INPUT_LEN: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
 pub enum Tab {
@@ -58,12 +64,27 @@ pub struct AppState {
     pub multisig_state: MultisigState,
     // Config
     pub config: Config,
+    /// App-level warnings from config load (bad permissions, unrecognised
+    /// network) — shown in the title bar. Distinct from per-PSBT warnings.
+    pub startup_warnings: Vec<String>,
     // AI overlay
     pub ai_open: bool,
     pub ai_question_input: String,
     pub ai_response: String,
     pub ai_loading: bool,
     pub ai_error: Option<String>,
+    ai_client: reqwest::Client,
+    /// Incremented on every AI query; tags the spawned task so stale
+    /// responses (e.g. after Esc cancels the overlay) are dropped.
+    ai_generation: u64,
+    /// Session-level consent to send PSBT/multisig context to the AI.
+    /// `None` until the user answers the first consent prompt.
+    pub ai_consent: Option<bool>,
+    /// `true` while the consent prompt is shown, blocking the query.
+    pub ai_consent_pending: bool,
+    /// Cached `build_context(...)` output — rebuilt only when `psbt_state`
+    /// or `multisig_state` changes, instead of every frame (P2).
+    ai_context: String,
     // Channel
     tx: mpsc::UnboundedSender<AppEvent>,
     rx: mpsc::UnboundedReceiver<AppEvent>,
@@ -72,6 +93,9 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (config, startup_warnings) =
+            load_config().unwrap_or_else(|_| (Config::default(), Vec::new()));
+        let ai_context = build_context(None, None);
         AppState {
             active_tab: Tab::Inspector,
             psbt_input: String::new(),
@@ -80,31 +104,59 @@ impl AppState {
             pubkey2_input: String::new(),
             builder_focus: BuilderFocus::Pubkey1,
             multisig_state: MultisigState::Empty,
-            config: load_config().unwrap_or_default(),
+            config,
+            startup_warnings,
             ai_open: false,
             ai_question_input: String::new(),
             ai_response: String::new(),
             ai_loading: false,
             ai_error: None,
+            ai_client: build_client(),
+            ai_generation: 0,
+            ai_consent: None,
+            ai_consent_pending: false,
+            ai_context,
             tx,
             rx,
         }
     }
 
     pub async fn run(&mut self, tui: &mut Tui) -> Result<()> {
+        use crossterm::event::EventStream;
+        use futures_util::StreamExt;
+
+        let mut events = EventStream::new();
+        tui.terminal.draw(|f| self.draw(f))?;
+
         loop {
-            while let Ok(event) = self.rx.try_recv() {
-                self.handle_event(event);
+            let mut redraw = false;
+
+            tokio::select! {
+                maybe_event = events.next() => {
+                    match maybe_event {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            if !self.handle_key(key) {
+                                break;
+                            }
+                            redraw = true;
+                        }
+                        Some(Ok(Event::Resize(_, _))) => redraw = true,
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => return Err(e.into()),
+                        None => break,
+                    }
+                }
+                Some(app_event) = self.rx.recv() => {
+                    self.handle_event(app_event);
+                    while let Ok(event) = self.rx.try_recv() {
+                        self.handle_event(event);
+                    }
+                    redraw = true;
+                }
             }
 
-            tui.terminal.draw(|f| self.draw(f))?;
-
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && !self.handle_key(key)
-            {
-                break;
+            if redraw {
+                tui.terminal.draw(|f| self.draw(f))?;
             }
         }
         Ok(())
@@ -117,22 +169,30 @@ impl AppState {
                     Ok(summary) => PsbtState::Ok(summary),
                     Err(e) => PsbtState::Err(e.to_string()),
                 };
+                self.rebuild_context();
             }
             AppEvent::MultisigBuilt(result) => {
                 self.multisig_state = match result {
                     Ok(info) => MultisigState::Ok(info),
                     Err(e) => MultisigState::Err(e.to_string()),
                 };
+                self.rebuild_context();
             }
-            AppEvent::AiChunk(text) => {
-                self.ai_response.push_str(&text);
+            AppEvent::AiChunk(generation, text) => {
+                if generation == self.ai_generation {
+                    self.ai_response.push_str(&text);
+                }
             }
-            AppEvent::AiDone => {
-                self.ai_loading = false;
+            AppEvent::AiDone(generation) => {
+                if generation == self.ai_generation {
+                    self.ai_loading = false;
+                }
             }
-            AppEvent::AiError(msg) => {
-                self.ai_loading = false;
-                self.ai_error = Some(msg);
+            AppEvent::AiError(generation, msg) => {
+                if generation == self.ai_generation {
+                    self.ai_loading = false;
+                    self.ai_error = Some(msg);
+                }
             }
         }
     }
@@ -165,8 +225,11 @@ impl AppState {
                 (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
                     self.psbt_input.clear();
                     self.psbt_state = PsbtState::Empty;
+                    self.rebuild_context();
                 }
-                (KeyCode::Char(c), _) => self.psbt_input.push(c),
+                (KeyCode::Char(c), _) if self.psbt_input.len() < MAX_PSBT_INPUT_LEN => {
+                    self.psbt_input.push(c);
+                }
                 _ => {}
             },
             Tab::Builder => match (key.code, key.modifiers) {
@@ -189,6 +252,7 @@ impl AppState {
                         BuilderFocus::Pubkey2 => self.pubkey2_input.clear(),
                     }
                     self.multisig_state = MultisigState::Empty;
+                    self.rebuild_context();
                 }
                 (KeyCode::Char(c), _) => match self.builder_focus {
                     BuilderFocus::Pubkey1 => self.pubkey1_input.push(c),
@@ -201,6 +265,25 @@ impl AppState {
     }
 
     fn handle_ai_key(&mut self, key: KeyEvent) -> bool {
+        if self.ai_consent_pending {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.ai_consent = Some(true);
+                    self.ai_consent_pending = false;
+                    self.start_ai_query();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.ai_consent = Some(false);
+                    self.ai_consent_pending = false;
+                    self.start_ai_query();
+                }
+                KeyCode::Esc => {
+                    self.ai_consent_pending = false;
+                }
+                _ => {}
+            }
+            return true;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
                 self.ai_open = false;
@@ -219,6 +302,20 @@ impl AppState {
         true
     }
 
+    /// Recompute the cached AI context from the current PSBT/multisig state.
+    /// Call whenever `psbt_state` or `multisig_state` changes (P2).
+    fn rebuild_context(&mut self) {
+        let psbt_ref = match &self.psbt_state {
+            PsbtState::Ok(s) => Some(s),
+            _ => None,
+        };
+        let multisig_ref = match &self.multisig_state {
+            MultisigState::Ok(s) => Some(s),
+            _ => None,
+        };
+        self.ai_context = build_context(psbt_ref, multisig_ref);
+    }
+
     fn toggle_tab(&mut self) {
         self.active_tab = match self.active_tab {
             Tab::Inspector => Tab::Builder,
@@ -234,7 +331,7 @@ impl AppState {
         }
         self.psbt_state = PsbtState::Loading;
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             let result = parse_psbt(&input);
             let _ = tx.send(AppEvent::PsbtParsed(result));
         });
@@ -248,9 +345,13 @@ impl AppState {
             return;
         }
         self.multisig_state = MultisigState::Loading;
-        let network = parse_network(&self.config.network).unwrap_or(bitcoin::Network::Testnet);
+        // S7: load_config() already validated `network`, falling back to
+        // "testnet" with a startup warning if it was unrecognised — this
+        // unwrap is just decoding that already-valid string.
+        let network =
+            parse_network(&self.config.network).expect("config.network validated at load");
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             let result = build_multisig(&pk1, &pk2, network, true);
             let _ = tx.send(AppEvent::MultisigBuilt(result));
         });
@@ -259,6 +360,9 @@ impl AppState {
     fn start_ai_query(&mut self) {
         let question = self.ai_question_input.trim().to_string();
         if question.is_empty() {
+            return;
+        }
+        if self.ai_loading {
             return;
         }
 
@@ -270,23 +374,45 @@ impl AppState {
             MultisigState::Ok(s) => Some(s),
             _ => None,
         };
-        let context = build_context(psbt_ref, multisig_ref);
+        let has_context = psbt_ref.is_some() || multisig_ref.is_some();
+
+        // S6: ask for session-level consent before the first context-bearing
+        // request. `ai_send_context = false` skips straight to "no context".
+        if has_context && self.config.ai_send_context && self.ai_consent.is_none() {
+            self.ai_consent_pending = true;
+            return;
+        }
+
+        let send_context =
+            has_context && self.config.ai_send_context && self.ai_consent == Some(true);
+        let context = if send_context {
+            self.ai_context.clone()
+        } else {
+            String::new()
+        };
 
         self.ai_response.clear();
         self.ai_error = None;
         self.ai_loading = true;
 
+        self.ai_generation += 1;
+        let generation = self.ai_generation;
+
         let api_key = self.config.api_key.clone();
         let model = self.config.ai_model.clone();
+        let client = self.ai_client.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match ask(&api_key, &model, &context, &question).await {
-                Ok(text) => {
-                    let _ = tx.send(AppEvent::AiChunk(text));
-                    let _ = tx.send(AppEvent::AiDone);
+            match ask(
+                &client, &api_key, &model, &context, &question, &tx, generation,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let _ = tx.send(AppEvent::AiDone(generation));
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::AiError(e.to_string()));
+                    let _ = tx.send(AppEvent::AiError(generation, e.to_string()));
                 }
             }
         });
@@ -294,24 +420,44 @@ impl AppState {
 
     fn draw(&self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+        let title_height = if self.startup_warnings.is_empty() {
+            3
+        } else {
+            4
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .constraints([Constraint::Length(title_height), Constraint::Min(0)])
             .split(area);
 
         let selected = match self.active_tab {
             Tab::Inspector => 0,
             Tab::Builder => 1,
         };
+        let title = format!(
+            "PSBT Inspector — network: {}  [Tab] switch  [?] AI  [Esc] quit",
+            self.config.network
+        );
         let tabs = Tabs::new(vec!["Inspector", "Builder"])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("PSBT Inspector  [Tab] switch  [?] AI  [Esc] quit"),
-            )
+            .block(Block::default().borders(Borders::ALL).title(title))
             .select(selected)
             .highlight_style(Style::default().fg(Color::Yellow));
         frame.render_widget(tabs, chunks[0]);
+
+        if !self.startup_warnings.is_empty() {
+            let warning_text = self.startup_warnings.join("; ");
+            let warning_area = ratatui::layout::Rect {
+                x: chunks[0].x + 1,
+                y: chunks[0].y + 2,
+                width: chunks[0].width.saturating_sub(2),
+                height: 1,
+            };
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(warning_text)
+                    .style(Style::default().fg(Color::Red)),
+                warning_area,
+            );
+        }
 
         match self.active_tab {
             Tab::Inspector => inspector::draw(frame, chunks[1], &self.psbt_state, &self.psbt_input),
@@ -326,15 +472,6 @@ impl AppState {
         }
 
         if self.ai_open {
-            let psbt_ref = match &self.psbt_state {
-                PsbtState::Ok(s) => Some(s),
-                _ => None,
-            };
-            let multisig_ref = match &self.multisig_state {
-                MultisigState::Ok(s) => Some(s),
-                _ => None,
-            };
-            let context = build_context(psbt_ref, multisig_ref);
             ai_overlay::draw(
                 frame,
                 area,
@@ -342,7 +479,8 @@ impl AppState {
                 &self.ai_response,
                 self.ai_loading,
                 self.ai_error.as_deref(),
-                &context,
+                &self.ai_context,
+                self.ai_consent_pending,
             );
         }
     }

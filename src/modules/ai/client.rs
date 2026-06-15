@@ -1,12 +1,28 @@
+use crate::event::AppEvent;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SYSTEM_PROMPT: &str = "You are an expert Bitcoin developer helping analyze PSBTs and multisig wallets. \
      Be concise and precise.";
+
+/// Build the shared `reqwest::Client` used for all AI requests.
+/// A single client reuses its connection pool/TLS session across requests
+/// and enforces a request timeout so a dead network can't hang `ai_loading`
+/// forever.
+pub fn build_client() -> Client {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest client config is static and valid")
+}
 
 #[derive(Debug, Error)]
 pub enum AiError {
@@ -28,6 +44,7 @@ struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     system: &'a str,
+    stream: bool,
     messages: Vec<Message<'a>>,
 }
 
@@ -37,30 +54,85 @@ struct Message<'a> {
     content: &'a str,
 }
 
-// ── Response types ────────────────────────────────────────────────────────────
+// ── Streaming event types ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct MessagesResponse {
-    content: Vec<ContentBlock>,
+struct StreamEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    delta: Option<StreamDelta>,
+    error: Option<StreamError>,
 }
 
 #[derive(Deserialize)]
-struct ContentBlock {
+struct StreamDelta {
     #[serde(rename = "type")]
-    block_type: String,
+    delta_type: Option<String>,
     text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamError {
+    message: String,
+}
+
+/// Result of parsing one SSE line.
+#[derive(Debug, PartialEq)]
+enum SseLine {
+    /// A `content_block_delta` text chunk to forward to the UI.
+    Text(String),
+    /// `message_stop` — the response is complete.
+    Done,
+    /// An `error` event from the API.
+    Error(String),
+    /// Any other event (`message_start`, `ping`, etc.) — ignored.
+    Other,
+}
+
+/// Parse one line of an SSE stream. Non-`data:` lines (blank lines, `event:`
+/// lines) are `Other`.
+fn parse_sse_line(line: &str) -> SseLine {
+    let Some(data) = line.strip_prefix("data:") else {
+        return SseLine::Other;
+    };
+    let data = data.trim();
+    let Ok(event) = serde_json::from_str::<StreamEvent>(data) else {
+        return SseLine::Other;
+    };
+    match event.event_type.as_str() {
+        "content_block_delta" => match event.delta {
+            Some(StreamDelta {
+                delta_type: Some(ref t),
+                text: Some(text),
+            }) if t == "text_delta" => SseLine::Text(text),
+            _ => SseLine::Other,
+        },
+        "message_stop" => SseLine::Done,
+        "error" => SseLine::Error(
+            event
+                .error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "unknown error".into()),
+        ),
+        _ => SseLine::Other,
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Call the Anthropic Messages API and return the full response text.
-/// Caller sends the result as a single AiChunk followed by AiDone.
+/// Call the Anthropic Messages API with streaming enabled, forwarding each
+/// text chunk as `AppEvent::AiChunk(generation, _)` as it arrives. The caller
+/// is responsible for sending `AiDone`/`AiError` based on the returned
+/// `Result` — this function itself never sends those.
 pub async fn ask(
+    client: &Client,
     api_key: &str,
     model: &str,
     context: &str,
     question: &str,
-) -> Result<String, AiError> {
+    tx: &mpsc::UnboundedSender<AppEvent>,
+    generation: u64,
+) -> Result<(), AiError> {
     if api_key.trim().is_empty() {
         return Err(AiError::NoApiKey);
     }
@@ -71,13 +143,13 @@ pub async fn ask(
         model,
         max_tokens: MAX_TOKENS,
         system: SYSTEM_PROMPT,
+        stream: true,
         messages: vec![Message {
             role: "user",
             content: &user_content,
         }],
     };
 
-    let client = Client::new();
     let response = client
         .post(ANTHROPIC_API_URL)
         .header("x-api-key", api_key)
@@ -87,23 +159,29 @@ pub async fn ask(
         .await?
         .error_for_status()?;
 
-    let resp: MessagesResponse = response.json().await?;
-    extract_text(resp).ok_or_else(|| AiError::ParseResponse("empty response body".into()))
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&buf[..pos]).trim_end().to_string();
+            buf.drain(..=pos);
+            match parse_sse_line(&line) {
+                SseLine::Text(text) => {
+                    let _ = tx.send(AppEvent::AiChunk(generation, text));
+                }
+                SseLine::Done => return Ok(()),
+                SseLine::Error(msg) => return Err(AiError::ParseResponse(msg)),
+                SseLine::Other => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_user_content(context: &str, question: &str) -> String {
     format!("{}\n\nQuestion: {}", context, question)
-}
-
-fn extract_text(response: MessagesResponse) -> Option<String> {
-    let text: String = response
-        .content
-        .into_iter()
-        .filter(|b| b.block_type == "text")
-        .filter_map(|b| b.text)
-        .collect::<Vec<_>>()
-        .join("");
-    if text.is_empty() { None } else { Some(text) }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -114,13 +192,21 @@ mod tests {
 
     #[tokio::test]
     async fn empty_api_key_returns_no_api_key_error() {
-        let err = ask("", "model", "ctx", "q").await.unwrap_err();
+        let client = build_client();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = ask(&client, "", "model", "ctx", "q", &tx, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AiError::NoApiKey));
     }
 
     #[tokio::test]
     async fn whitespace_api_key_returns_no_api_key_error() {
-        let err = ask("   ", "model", "ctx", "q").await.unwrap_err();
+        let client = build_client();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = ask(&client, "   ", "model", "ctx", "q", &tx, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AiError::NoApiKey));
     }
 
@@ -130,6 +216,7 @@ mod tests {
             model: "claude-sonnet-4-5",
             max_tokens: MAX_TOKENS,
             system: SYSTEM_PROMPT,
+            stream: true,
             messages: vec![Message {
                 role: "user",
                 content: "test",
@@ -138,6 +225,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("claude-sonnet-4-5"), "json: {json}");
         assert!(json.contains("max_tokens"), "json: {json}");
+        assert!(json.contains("\"stream\":true"), "json: {json}");
     }
 
     #[test]
@@ -156,60 +244,39 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_from_single_text_block() {
-        let resp = MessagesResponse {
-            content: vec![ContentBlock {
-                block_type: "text".into(),
-                text: Some("Claude says hi".into()),
-            }],
-        };
-        assert_eq!(extract_text(resp), Some("Claude says hi".into()));
+    fn sse_content_block_delta_yields_text() {
+        let line =
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}"#;
+        assert_eq!(parse_sse_line(line), SseLine::Text("Hello".into()));
     }
 
     #[test]
-    fn extract_text_joins_multiple_text_blocks() {
-        let resp = MessagesResponse {
-            content: vec![
-                ContentBlock {
-                    block_type: "text".into(),
-                    text: Some("Hello ".into()),
-                },
-                ContentBlock {
-                    block_type: "text".into(),
-                    text: Some("world".into()),
-                },
-            ],
-        };
-        assert_eq!(extract_text(resp), Some("Hello world".into()));
+    fn sse_message_stop_yields_done() {
+        let line = r#"data: {"type":"message_stop"}"#;
+        assert_eq!(parse_sse_line(line), SseLine::Done);
     }
 
     #[test]
-    fn extract_text_ignores_non_text_blocks() {
-        let resp = MessagesResponse {
-            content: vec![
-                ContentBlock {
-                    block_type: "tool_use".into(),
-                    text: None,
-                },
-                ContentBlock {
-                    block_type: "text".into(),
-                    text: Some("answer".into()),
-                },
-            ],
-        };
-        assert_eq!(extract_text(resp), Some("answer".into()));
+    fn sse_error_event_yields_error() {
+        let line = r#"data: {"type":"error","error":{"message":"overloaded"}}"#;
+        assert_eq!(parse_sse_line(line), SseLine::Error("overloaded".into()));
     }
 
     #[test]
-    fn extract_text_returns_none_for_empty_response() {
-        let resp = MessagesResponse { content: vec![] };
-        assert_eq!(extract_text(resp), None);
+    fn sse_ping_yields_other() {
+        let line = r#"data: {"type":"ping"}"#;
+        assert_eq!(parse_sse_line(line), SseLine::Other);
     }
 
     #[test]
-    fn parses_response_json_from_string() {
-        let json = r#"{"content":[{"type":"text","text":"Bitcoin is cool"}]}"#;
-        let resp: MessagesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(extract_text(resp), Some("Bitcoin is cool".into()));
+    fn sse_non_data_line_yields_other() {
+        assert_eq!(parse_sse_line("event: content_block_delta"), SseLine::Other);
+        assert_eq!(parse_sse_line(""), SseLine::Other);
+    }
+
+    #[test]
+    fn sse_content_block_delta_without_text_delta_yields_other() {
+        let line = r#"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","text":null}}"#;
+        assert_eq!(parse_sse_line(line), SseLine::Other);
     }
 }

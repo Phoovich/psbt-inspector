@@ -68,6 +68,8 @@ pub enum FeeInfo {
     Known(u64),
     /// At least one input is missing UTXO data; fee cannot be calculated.
     Unknown,
+    /// Outputs spend more than the inputs provide — not a valid transaction.
+    Invalid { input_total: u64, output_total: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +132,7 @@ fn summarize(psbt: BitcoinPsbt) -> PsbtSummary {
     let output_count = psbt.unsigned_tx.output.len();
 
     let mut total_input_value: Option<u64> = Some(0);
+    let mut warnings: Vec<String> = Vec::new();
 
     let inputs: Vec<InputSummary> = psbt
         .unsigned_tx
@@ -138,7 +141,10 @@ fn summarize(psbt: BitcoinPsbt) -> PsbtSummary {
         .zip(&psbt.inputs)
         .enumerate()
         .map(|(i, (tx_in, psbt_in))| {
-            let value = input_utxo_value(psbt_in, tx_in);
+            let (value, warning) = input_utxo_value(psbt_in, tx_in, i);
+            if let Some(w) = warning {
+                warnings.push(w);
+            }
             total_input_value = match (total_input_value, value) {
                 (Some(total), Some(v)) => Some(total.saturating_add(v)),
                 _ => None,
@@ -186,6 +192,7 @@ fn summarize(psbt: BitcoinPsbt) -> PsbtSummary {
         outputs,
         total_input_value,
         signed_inputs,
+        warnings,
     )
 }
 
@@ -193,6 +200,7 @@ fn summarize(psbt: BitcoinPsbt) -> PsbtSummary {
 /// assembles the final `PsbtSummary`.
 ///
 /// `total_input_value` is `None` if any input's UTXO value is unknown.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize(
     version: u8,
     input_count: usize,
@@ -201,17 +209,21 @@ pub(super) fn finalize(
     outputs: Vec<OutputSummary>,
     total_input_value: Option<u64>,
     signed_inputs: usize,
+    mut warnings: Vec<String>,
 ) -> PsbtSummary {
     let total_output_value: u64 = outputs.iter().map(|o| o.value).sum();
 
     let fee = match total_input_value {
+        Some(total_in) if input_count > 0 && total_in < total_output_value => FeeInfo::Invalid {
+            input_total: total_in,
+            output_total: total_output_value,
+        },
         Some(total_in) if input_count > 0 => {
             FeeInfo::Known(total_in.saturating_sub(total_output_value))
         }
         _ => FeeInfo::Unknown,
     };
 
-    let mut warnings = Vec::new();
     if signed_inputs < input_count {
         warnings.push(format!(
             "{} of {} inputs signed — not ready to broadcast",
@@ -220,6 +232,15 @@ pub(super) fn finalize(
     }
     if matches!(fee, FeeInfo::Unknown) && input_count > 0 {
         warnings.push("Fee unknown — UTXO values not embedded in this PSBT".into());
+    }
+    if let FeeInfo::Invalid {
+        input_total,
+        output_total,
+    } = fee
+    {
+        warnings.push(format!(
+            "outputs exceed inputs ({output_total} sats > {input_total} sats) — invalid transaction"
+        ));
     }
 
     PsbtSummary {
@@ -238,16 +259,34 @@ pub(super) fn finalize(
 }
 
 /// Extract the UTXO value for a PSBT input, checking witness_utxo first
-/// then falling back to non_witness_utxo.
-fn input_utxo_value(psbt_in: &bitcoin::psbt::Input, tx_in: &bitcoin::TxIn) -> Option<u64> {
+/// then falling back to non_witness_utxo. Returns an optional warning
+/// describing why the value should not be fully trusted.
+fn input_utxo_value(
+    psbt_in: &bitcoin::psbt::Input,
+    tx_in: &bitcoin::TxIn,
+    index: usize,
+) -> (Option<u64>, Option<String>) {
     if let Some(utxo) = &psbt_in.witness_utxo {
-        return Some(utxo.value.to_sat());
+        return (
+            Some(utxo.value.to_sat()),
+            Some(format!(
+                "input {index}: value from witness_utxo (unverifiable)"
+            )),
+        );
     }
     if let Some(prev_tx) = &psbt_in.non_witness_utxo {
+        if prev_tx.compute_txid() != tx_in.previous_output.txid {
+            return (
+                None,
+                Some(format!(
+                    "input {index}: non_witness_utxo does not match input txid"
+                )),
+            );
+        }
         let vout = tx_in.previous_output.vout as usize;
-        return prev_tx.output.get(vout).map(|o| o.value.to_sat());
+        return (prev_tx.output.get(vout).map(|o| o.value.to_sat()), None);
     }
-    None
+    (None, None)
 }
 
 fn input_script_type(psbt_in: &bitcoin::psbt::Input, tx_in: &bitcoin::TxIn) -> ScriptType {
@@ -423,5 +462,116 @@ mod tests {
     fn fake_summary_signing_progress_is_partial() {
         let s = PsbtSummary::fake();
         assert!(s.signing_progress.signed_inputs < s.signing_progress.total_inputs);
+    }
+
+    // ─── S3: fee-spoofing via mismatched non_witness_utxo ────────────────────
+
+    #[test]
+    fn non_witness_utxo_with_mismatched_txid_is_rejected() {
+        // The previous transaction actually being spent.
+        let prev_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        // The spending tx claims to spend a *different* (fake) txid.
+        let fake_txid = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(999_999),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+        .compute_txid();
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: fake_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("valid unsigned tx");
+        psbt.inputs[0].non_witness_utxo = Some(prev_tx);
+        let b64 = STANDARD.encode(psbt.serialize());
+
+        let summary = parse_psbt(&b64).unwrap();
+        assert_eq!(summary.inputs[0].value, None);
+        assert!(matches!(summary.fee, FeeInfo::Unknown));
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("does not match")),
+            "warnings: {:?}",
+            summary.warnings
+        );
+    }
+
+    // ─── S4: outputs exceeding inputs ─────────────────────────────────────────
+
+    #[test]
+    fn outputs_exceeding_inputs_is_invalid_fee() {
+        let prev_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let prev_txid = prev_tx.compute_txid();
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000), // exceeds the 10_000-sat input
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("valid unsigned tx");
+        psbt.inputs[0].non_witness_utxo = Some(prev_tx);
+        let b64 = STANDARD.encode(psbt.serialize());
+
+        let summary = parse_psbt(&b64).unwrap();
+        assert!(matches!(summary.fee, FeeInfo::Invalid { .. }));
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("outputs exceed inputs")),
+            "warnings: {:?}",
+            summary.warnings
+        );
     }
 }

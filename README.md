@@ -92,9 +92,10 @@ Requires an API key (see Configuration below).
 Create `~/.config/psbt-inspector/config.toml`:
 
 ```toml
-api_key   = "sk-ant-..."   # Anthropic API key — required for AI assistant
-network   = "testnet"      # bitcoin | testnet | signet | regtest
-ai_model  = "claude-sonnet-4-5"
+api_key          = "sk-ant-..."   # Anthropic API key — required for AI assistant
+network          = "testnet"      # bitcoin | testnet | signet | regtest
+ai_model         = "claude-sonnet-4-5"
+ai_send_context  = true           # set false to never send PSBT/multisig data to the AI
 ```
 
 Environment variables override the config file:
@@ -107,6 +108,25 @@ Environment variables override the config file:
 
 If `api_key` is empty the AI assistant shows an actionable error instead of crashing.
 
+The config file may contain your API key in plaintext. **Prefer
+`PSBT_INSPECTOR_API_KEY`** so the key never touches disk. If
+`config.toml` is readable by other users (e.g. mode `644`), a startup
+warning is shown in the title bar — run `chmod 600
+~/.config/psbt-inspector/config.toml` to fix it.
+
+If `network` is set to an unrecognised value, a startup warning is shown
+and the app falls back to `testnet` (it never silently uses an
+unexpected network).
+
+### AI privacy
+
+When you ask the AI assistant a question while a PSBT or multisig address
+is loaded, the app can send that context (input/output txids, values,
+addresses, redeem script pubkeys) along with your question to the
+Anthropic API. The first time this would happen in a session, you're
+asked for consent (`[y/n]`); your answer applies for the rest of the
+session only. Set `ai_send_context = false` to never send this context.
+
 ---
 
 ## Development
@@ -114,7 +134,7 @@ If `api_key` is empty the AI assistant shows an actionable error instead of cras
 ```bash
 cargo build        # compile
 cargo run          # run the TUI
-cargo test         # run all tests (57 tests)
+cargo test         # run all tests (63 tests)
 cargo clippy       # lint
 cargo fmt          # format
 ```

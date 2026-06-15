@@ -5,6 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -13,6 +14,7 @@ pub fn draw(
     loading: bool,
     error: Option<&str>,
     context: &str,
+    consent_pending: bool,
 ) {
     let popup = centered_rect(88, 84, area);
     frame.render_widget(Clear, popup);
@@ -54,7 +56,19 @@ pub fn draw(
     frame.render_widget(context_widget, chunks[0]);
 
     // Question input — always shows cursor
-    let question_widget = Paragraph::new(question).block(
+    let q_inner = chunks[1].inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let q_width = q_inner.width as usize;
+    let q_char_count = question.chars().count();
+    let q_visible: String = if q_char_count > q_width {
+        question.chars().skip(q_char_count - q_width).collect()
+    } else {
+        question.to_string()
+    };
+
+    let question_widget = Paragraph::new(q_visible).block(
         Block::default()
             .borders(Borders::ALL)
             .title("Question")
@@ -62,11 +76,7 @@ pub fn draw(
     );
     frame.render_widget(question_widget, chunks[1]);
 
-    let q_inner = chunks[1].inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let cursor_x = (q_inner.x + question.chars().count() as u16).min(q_inner.x + q_inner.width);
+    let cursor_x = (q_inner.x + q_char_count.min(q_width) as u16).min(q_inner.x + q_inner.width);
     frame.set_cursor_position(Position {
         x: cursor_x,
         y: q_inner.y,
@@ -82,6 +92,21 @@ pub fn draw(
         .block(Block::default().borders(Borders::ALL).title(response_title))
         .wrap(Wrap { trim: false });
     frame.render_widget(response_widget, chunks[2]);
+
+    // Consent prompt overlays the response area while pending.
+    if consent_pending {
+        let prompt = Paragraph::new(
+            "Send PSBT/multisig context (txid, value, address, pubkey) to the AI? [y/n]",
+        )
+        .style(Style::default().fg(Color::Yellow))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Consent required"),
+        )
+        .wrap(Wrap { trim: false });
+        frame.render_widget(prompt, chunks[2]);
+    }
 
     // Status line
     if let Some(err) = error {

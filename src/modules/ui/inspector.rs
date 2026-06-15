@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Paragraph, Row, Table},
 };
 
 /// Top-level draw entry for the Inspector panel.
@@ -48,17 +48,25 @@ fn draw_input_box(frame: &mut Frame, area: Rect, input: &str) {
         .borders(Borders::ALL)
         .title("PSBT Input  [Enter] parse  [Ctrl+U] clear  [Esc] quit");
 
-    let p = Paragraph::new(input)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(p, area);
-
-    // Place cursor after the last character, clamped to the inner width.
     let inner = area.inner(ratatui::layout::Margin {
         horizontal: 1,
         vertical: 1,
     });
-    let cursor_x = (inner.x + input.chars().count() as u16).min(inner.x + inner.width);
+
+    // Show only the tail that fits the box, so typing/pasting stays O(width)
+    // instead of re-wrapping the whole (possibly multi-MB) input every frame.
+    let width = inner.width as usize;
+    let char_count = input.chars().count();
+    let visible: String = if char_count > width {
+        input.chars().skip(char_count - width).collect()
+    } else {
+        input.to_string()
+    };
+
+    let p = Paragraph::new(visible).block(block);
+    frame.render_widget(p, area);
+
+    let cursor_x = (inner.x + char_count.min(width) as u16).min(inner.x + inner.width);
     frame.set_cursor_position(Position {
         x: cursor_x,
         y: inner.y,
@@ -80,6 +88,19 @@ fn draw_summary(frame: &mut Frame, area: Rect, s: &PsbtSummary) {
     let fee_str = match &s.fee {
         FeeInfo::Known(sats) => format!("{} sats", sats),
         FeeInfo::Unknown => "unknown (UTXO data missing)".into(),
+        FeeInfo::Invalid {
+            input_total,
+            output_total,
+        } => format!("INVALID (outputs {output_total} > inputs {input_total})"),
+    };
+    let fee_line = Line::from(format!(
+        "Fee: {}   Signing: {}/{}",
+        fee_str, s.signing_progress.signed_inputs, s.signing_progress.total_inputs,
+    ));
+    let fee_line = if matches!(s.fee, FeeInfo::Invalid { .. }) {
+        fee_line.style(Style::default().fg(Color::Red))
+    } else {
+        fee_line
     };
     let mut lines = vec![
         Line::from(format!("PSBT v{}", s.version)),
@@ -87,10 +108,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, s: &PsbtSummary) {
             "Inputs: {}   Outputs: {}",
             s.input_count, s.output_count
         )),
-        Line::from(format!(
-            "Fee: {}   Signing: {}/{}",
-            fee_str, s.signing_progress.signed_inputs, s.signing_progress.total_inputs,
-        )),
+        fee_line,
     ];
     for w in &s.warnings {
         lines.push(Line::styled(

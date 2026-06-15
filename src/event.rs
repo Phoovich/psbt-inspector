@@ -8,7 +8,9 @@ use crate::modules::bitcoin::{
 pub enum AppEvent {
     PsbtParsed(Result<PsbtSummary, PsbtError>),
     MultisigBuilt(Result<MultisigInfo, MultisigError>),
-    AiChunk(String),
-    AiDone,
-    AiError(String),
+    /// AI events carry the generation ID of the query that produced them, so
+    /// the UI loop can drop responses from a stale/cancelled query.
+    AiChunk(u64, String),
+    AiDone(u64),
+    AiError(u64, String),
 }

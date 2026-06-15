@@ -44,10 +44,11 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], PsbtError> {
-        let end = self.pos + len;
-        if end > self.bytes.len() {
+        let remaining = self.bytes.len() - self.pos;
+        if len > remaining {
             return Err(PsbtError::Decode("unexpected end of PSBT data".into()));
         }
+        let end = self.pos + len;
         let slice = &self.bytes[self.pos..end];
         self.pos = end;
         Ok(slice)
@@ -119,6 +120,49 @@ fn extract_prev_output(tx_bytes: &[u8], vout: u32) -> Option<(u64, ScriptBuf)> {
     None
 }
 
+/// Result of verifying a `non_witness_utxo` against the input's previous txid.
+enum PrevOutputResult {
+    /// The embedded tx hashed to the expected txid; value is trustworthy.
+    Verified(u64, ScriptBuf),
+    /// The embedded tx hashed to a *different* txid — value is discarded.
+    Mismatch,
+    /// The embedded tx could not be deserialized (e.g. empty-witness segwit),
+    /// so its hash could not be checked; value is kept but unverifiable.
+    Unverifiable(u64, ScriptBuf),
+    /// `vout` is out of range for the embedded tx's outputs.
+    NotFound,
+}
+
+/// Verifies `prev_tx_bytes` hashes to `expected_txid` (S3 — fee-spoofing
+/// protection) before trusting its output value. Tries the standard decoder
+/// first since it gives us `compute_txid()`; falls back to the hand-rolled
+/// `extract_prev_output` (which tolerates empty-witness segwit txs the
+/// decoder rejects) when that fails, marking the value unverifiable.
+fn verify_and_extract_prev_output(
+    prev_tx_bytes: &[u8],
+    vout: u32,
+    expected_txid: Txid,
+    _index: usize,
+) -> PrevOutputResult {
+    match consensus::deserialize::<bitcoin::Transaction>(prev_tx_bytes) {
+        Ok(tx) => {
+            if tx.compute_txid() != expected_txid {
+                return PrevOutputResult::Mismatch;
+            }
+            match tx.output.get(vout as usize) {
+                Some(out) => {
+                    PrevOutputResult::Verified(out.value.to_sat(), out.script_pubkey.clone())
+                }
+                None => PrevOutputResult::NotFound,
+            }
+        }
+        Err(_) => match extract_prev_output(prev_tx_bytes, vout) {
+            Some((amount, script)) => PrevOutputResult::Unverifiable(amount, script),
+            None => PrevOutputResult::NotFound,
+        },
+    }
+}
+
 /// Parse a PSBTv2 (BIP-370) from raw decoded bytes.
 pub(super) fn parse(bytes: &[u8]) -> Result<PsbtSummary, PsbtError> {
     if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
@@ -160,9 +204,17 @@ pub(super) fn parse(bytes: &[u8]) -> Result<PsbtSummary, PsbtError> {
         as usize;
 
     // ── Per-input maps ──
+    // Each input map needs at least 1 byte (its separator), so a count larger
+    // than the remaining bytes cannot be real — reject before allocating.
+    if input_count > cur.bytes.len() - cur.pos {
+        return Err(PsbtError::Decode(
+            "PSBT_GLOBAL_INPUT_COUNT exceeds remaining data".into(),
+        ));
+    }
     let mut inputs = Vec::with_capacity(input_count);
     let mut total_input_value: Option<u64> = Some(0);
     let mut signed_inputs = 0;
+    let mut warnings: Vec<String> = Vec::new();
 
     for i in 0..input_count {
         let mut txid: Option<Txid> = None;
@@ -194,6 +246,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<PsbtSummary, PsbtError> {
                     })?;
                     value = Some(txout.value.to_sat());
                     script_type = script_type_from_script(&txout.script_pubkey);
+                    warnings.push(format!("input {i}: value from witness_utxo (unverifiable)"));
                 }
                 PSBT_IN_PARTIAL_SIG => partial_sigs += 1,
                 PSBT_IN_FINAL_SCRIPTSIG | PSBT_IN_FINAL_SCRIPTWITNESS => signed = true,
@@ -211,10 +264,26 @@ pub(super) fn parse(bytes: &[u8]) -> Result<PsbtSummary, PsbtError> {
         // was provided directly.
         if value.is_none()
             && let Some(prev_tx_bytes) = &non_witness_utxo
-            && let Some((amount, script)) = extract_prev_output(prev_tx_bytes, vout)
         {
-            value = Some(amount);
-            script_type = script_type_from_script(&script);
+            match verify_and_extract_prev_output(prev_tx_bytes, vout, txid, i) {
+                PrevOutputResult::Verified(amount, script) => {
+                    value = Some(amount);
+                    script_type = script_type_from_script(&script);
+                }
+                PrevOutputResult::Mismatch => {
+                    warnings.push(format!(
+                        "input {i}: non_witness_utxo does not match input txid"
+                    ));
+                }
+                PrevOutputResult::Unverifiable(amount, script) => {
+                    value = Some(amount);
+                    script_type = script_type_from_script(&script);
+                    warnings.push(format!(
+                        "input {i}: non_witness_utxo could not be verified against input txid"
+                    ));
+                }
+                PrevOutputResult::NotFound => {}
+            }
         }
 
         total_input_value = match (total_input_value, value) {
@@ -237,6 +306,11 @@ pub(super) fn parse(bytes: &[u8]) -> Result<PsbtSummary, PsbtError> {
     }
 
     // ── Per-output maps ──
+    if output_count > cur.bytes.len() - cur.pos {
+        return Err(PsbtError::Decode(
+            "PSBT_GLOBAL_OUTPUT_COUNT exceeds remaining data".into(),
+        ));
+    }
     let mut outputs = Vec::with_capacity(output_count);
 
     for i in 0..output_count {
@@ -278,6 +352,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<PsbtSummary, PsbtError> {
         outputs,
         total_input_value,
         signed_inputs,
+        warnings,
     ))
 }
 
@@ -365,6 +440,35 @@ mod tests {
         // Txid Display reverses the raw 32 bytes [1, 2, ..., 32] -> [32, ..., 1].
         let expected_txid: [u8; 32] = core::array::from_fn(|i| 32 - i as u8);
         assert_eq!(summary.inputs[0].txid, hex::encode(expected_txid));
+    }
+
+    /// S1 PoC: a compact-size length of u64::MAX in `PSBT_IN_PREVIOUS_TXID`'s
+    /// value would overflow `pos + len` before the old bounds check ran.
+    #[test]
+    fn read_bytes_overflow_is_decode_error_not_panic() {
+        let b64 = "cHNidP8B+wQCAAAAAQQBAQEFAQEAAQD///////////8=";
+        let err = parse_psbt(b64).unwrap_err();
+        assert!(matches!(err, PsbtError::Decode(_)));
+    }
+
+    /// S2 PoC: `PSBT_GLOBAL_INPUT_COUNT` of u64::MAX would previously be
+    /// passed straight into `Vec::with_capacity`, panicking with "capacity
+    /// overflow" / OOM.
+    #[test]
+    fn huge_input_count_is_decode_error_not_panic() {
+        let b64 = "cHNidP8B+wQCAAAAAQQJ////////////AQUBAQA=";
+        let err = parse_psbt(b64).unwrap_err();
+        assert!(matches!(err, PsbtError::Decode(_)));
+    }
+
+    /// S4 PoC: outputs (0xC3_5_0_0_0_0 sats) exceed inputs (0 sats, since this
+    /// input carries no UTXO data) — must surface as `FeeInfo::Invalid`, not
+    /// a silent "Fee: 0".
+    #[test]
+    fn psbtv2_outputs_exceeding_inputs_is_invalid_fee() {
+        let b64 = "cHNidP8B+wQCAAAAAQQBAQEFAQEAAQ4gAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyABDwQAAAAAAQEJECcAAAAAAAAAAAEDCFDDAAAAAAAAAQQAAA==";
+        let summary = parse_psbt(b64).unwrap();
+        assert!(matches!(summary.fee, FeeInfo::Invalid { .. }));
     }
 
     #[test]

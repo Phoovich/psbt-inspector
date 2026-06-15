@@ -19,6 +19,10 @@ pub struct Config {
     pub api_key: String,
     pub network: String,
     pub ai_model: String,
+    /// Opt-out: set to `false` to never send the PSBT/multisig context to
+    /// the AI assistant. Even when `true`, the user is asked for
+    /// session-level consent before the first request (S6).
+    pub ai_send_context: bool,
 }
 
 impl Default for Config {
@@ -27,6 +31,7 @@ impl Default for Config {
             api_key: String::new(),
             network: "testnet".into(),
             ai_model: "claude-sonnet-4-5".into(),
+            ai_send_context: true,
         }
     }
 }
@@ -35,10 +40,23 @@ impl Default for Config {
 
 /// Load config from `~/.config/psbt-inspector/config.toml`.
 /// Missing file → `Config::default()`. Env vars applied last and always win.
-pub fn load_config() -> Result<Config, ConfigError> {
-    let mut config = load_from_path(config_path())?;
+///
+/// Returns app-level startup warnings (S5 loose file permissions, S7 an
+/// unrecognised `network` value) for display in the title bar — distinct
+/// from the per-PSBT warnings in `PsbtSummary.warnings`.
+pub fn load_config() -> Result<(Config, Vec<String>), ConfigError> {
+    let (mut config, mut warnings) = load_from_path(config_path())?;
     apply_env_overrides(&mut config);
-    Ok(config)
+
+    if parse_network(&config.network).is_none() {
+        warnings.push(format!(
+            "config: network \"{}\" is not recognised — using testnet",
+            config.network
+        ));
+        config.network = "testnet".into();
+    }
+
+    Ok((config, warnings))
 }
 
 /// Returns `~/.config/psbt-inspector/config.toml`.
@@ -65,13 +83,32 @@ pub fn parse_network(s: &str) -> Option<bitcoin::Network> {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-fn load_from_path(path: PathBuf) -> Result<Config, ConfigError> {
+fn load_from_path(path: PathBuf) -> Result<(Config, Vec<String>), ConfigError> {
     if !path.exists() {
-        return Ok(Config::default());
+        return Ok((Config::default(), Vec::new()));
     }
+    let mut warnings = Vec::new();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                warnings.push(format!(
+                    "config file {} is readable by other users (mode {:o}) — \
+                     it may contain your Anthropic API key in plaintext; \
+                     consider `chmod 600` or using PSBT_INSPECTOR_API_KEY instead",
+                    path.display(),
+                    mode & 0o777
+                ));
+            }
+        }
+    }
+
     let content = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&content)?;
-    Ok(config)
+    Ok((config, warnings))
 }
 
 fn apply_env_overrides(config: &mut Config) {
@@ -117,7 +154,8 @@ mod tests {
 
     #[test]
     fn missing_file_returns_default() {
-        let config = load_from_path(PathBuf::from("/nonexistent/psbt_test/config.toml")).unwrap();
+        let (config, _) =
+            load_from_path(PathBuf::from("/nonexistent/psbt_test/config.toml")).unwrap();
         assert_eq!(config.network, "testnet");
     }
 
@@ -131,7 +169,7 @@ mod tests {
             "api_key = \"file-key\"\nnetwork = \"mainnet\"\nai_model = \"claude-opus-4-8\"\n",
         )
         .unwrap();
-        let config = load_from_path(path).unwrap();
+        let (config, _) = load_from_path(path).unwrap();
         assert_eq!(config.api_key, "file-key");
         assert_eq!(config.network, "mainnet");
         assert_eq!(config.ai_model, "claude-opus-4-8");
@@ -144,7 +182,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "api_key = \"only-key\"\n").unwrap();
-        let config = load_from_path(path).unwrap();
+        let (config, _) = load_from_path(path).unwrap();
         assert_eq!(config.api_key, "only-key");
         assert_eq!(config.network, "testnet");
         assert_eq!(config.ai_model, "claude-sonnet-4-5");
