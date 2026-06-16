@@ -26,10 +26,7 @@ pub fn build_client() -> Client {
 
 #[derive(Debug, Error)]
 pub enum AiError {
-    #[error(
-        "No API key — set api_key in ~/.config/psbt-inspector/config.toml \
-         or PSBT_INSPECTOR_API_KEY env var"
-    )]
+    #[error("No API key — set PSBT_INSPECTOR_API_KEY in your .env file or shell environment")]
     NoApiKey,
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),

@@ -1,0 +1,6 @@
+# Copy to ~/.config/psbt-inspector/config.toml
+# API key goes in .env, not here — see .env.example
+
+network          = "testnet"      # bitcoin | testnet | signet | regtest
+ai_model         = "claude-sonnet-4-5"
+ai_send_context  = true           # set false to never send PSBT/multisig data to the AI

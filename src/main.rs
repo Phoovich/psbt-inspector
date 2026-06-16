@@ -7,6 +7,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok(); // load .env if present; silently ignored if absent
     // Restore terminal on panic so the shell isn't left in raw mode.
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

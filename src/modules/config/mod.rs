@@ -16,7 +16,6 @@ pub enum ConfigError {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Config {
-    pub api_key: String,
     pub network: String,
     pub ai_model: String,
     /// Opt-out: set to `false` to never send the PSBT/multisig context to
@@ -28,7 +27,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            api_key: String::new(),
             network: "testnet".into(),
             ai_model: "claude-sonnet-4-5".into(),
             ai_send_context: true,
@@ -98,34 +96,12 @@ fn load_from_path(path: PathBuf) -> Result<(Config, Vec<String>), ConfigError> {
     if !path.exists() {
         return Ok((Config::default(), Vec::new()));
     }
-    let mut warnings = Vec::new();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            let mode = metadata.permissions().mode();
-            if mode & 0o077 != 0 {
-                warnings.push(format!(
-                    "config file {} is readable by other users (mode {:o}) — \
-                     it may contain your Anthropic API key in plaintext; \
-                     consider `chmod 600` or using PSBT_INSPECTOR_API_KEY instead",
-                    path.display(),
-                    mode & 0o777
-                ));
-            }
-        }
-    }
-
     let content = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&content)?;
-    Ok((config, warnings))
+    Ok((config, Vec::new()))
 }
 
 fn apply_env_overrides(config: &mut Config) {
-    if let Ok(key) = std::env::var("PSBT_INSPECTOR_API_KEY") {
-        config.api_key = key;
-    }
     if let Ok(net) = std::env::var("PSBT_INSPECTOR_NETWORK") {
         config.network = net;
     }
@@ -145,11 +121,6 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ─── Default ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn default_api_key_is_empty() {
-        assert_eq!(Config::default().api_key, "");
-    }
 
     #[test]
     fn default_network_is_testnet() {
@@ -177,11 +148,10 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            "api_key = \"file-key\"\nnetwork = \"mainnet\"\nai_model = \"claude-opus-4-8\"\n",
+            "network = \"mainnet\"\nai_model = \"claude-opus-4-8\"\n",
         )
         .unwrap();
         let (config, _) = load_from_path(path).unwrap();
-        assert_eq!(config.api_key, "file-key");
         assert_eq!(config.network, "mainnet");
         assert_eq!(config.ai_model, "claude-opus-4-8");
         let _ = std::fs::remove_dir_all(dir);
@@ -192,30 +162,14 @@ mod tests {
         let dir = std::env::temp_dir().join("psbt_inspector_cfg_partial");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, "api_key = \"only-key\"\n").unwrap();
+        std::fs::write(&path, "network = \"signet\"\n").unwrap();
         let (config, _) = load_from_path(path).unwrap();
-        assert_eq!(config.api_key, "only-key");
-        assert_eq!(config.network, "testnet");
+        assert_eq!(config.network, "signet");
         assert_eq!(config.ai_model, "claude-sonnet-4-5");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     // ─── Env var overrides ───────────────────────────────────────────────────
-
-    #[test]
-    fn env_var_overrides_api_key() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: serialised by ENV_LOCK; no other test sets this var concurrently.
-        unsafe {
-            std::env::set_var("PSBT_INSPECTOR_API_KEY", "env-api-key");
-        }
-        let mut config = Config::default();
-        apply_env_overrides(&mut config);
-        unsafe {
-            std::env::remove_var("PSBT_INSPECTOR_API_KEY");
-        }
-        assert_eq!(config.api_key, "env-api-key");
-    }
 
     #[test]
     fn env_var_overrides_network() {
@@ -318,45 +272,6 @@ mod tests {
         };
         assert!(validate_network(&mut config).is_none());
         assert_eq!(config.network, "signet");
-    }
-
-    // ─── S5: config file permission warning ─────────────────────────────────
-
-    #[cfg(unix)]
-    #[test]
-    fn loose_permissions_produce_a_warning() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join("psbt_inspector_cfg_perm_loose");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "api_key = \"x\"\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let (_, warnings) = load_from_path(path).unwrap();
-        assert!(
-            warnings.iter().any(|w| w.contains("readable by other")),
-            "warnings: {warnings:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn strict_permissions_produce_no_warning() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join("psbt_inspector_cfg_perm_strict");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "api_key = \"x\"\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        let (_, warnings) = load_from_path(path).unwrap();
-        assert!(warnings.is_empty(), "warnings: {warnings:?}");
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

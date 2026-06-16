@@ -425,7 +425,7 @@ impl AppState {
         self.ai_generation += 1;
         let generation = self.ai_generation;
 
-        let api_key = self.config.api_key.clone();
+        let api_key = std::env::var("PSBT_INSPECTOR_API_KEY").unwrap_or_default();
         let model = self.config.ai_model.clone();
         let client = self.ai_client.clone();
         let tx = self.tx.clone();

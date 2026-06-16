@@ -89,10 +89,31 @@ Requires an API key (see Configuration below).
 
 ## Configuration
 
+### API key (required for AI assistant)
+
+Copy `.env.example` to `.env` and add your Anthropic API key:
+
+```bash
+cp .env.example .env
+# then edit .env:
+PSBT_INSPECTOR_API_KEY=sk-ant-...
+```
+
+`.env` is gitignored — your key never touches version control.
+You can also export it in your shell instead:
+
+```bash
+export PSBT_INSPECTOR_API_KEY=sk-ant-...
+cargo run
+```
+
+If the key is missing the AI assistant shows an actionable error instead of crashing.
+
+### Non-secret settings
+
 Create `~/.config/psbt-inspector/config.toml`:
 
 ```toml
-api_key          = "sk-ant-..."   # Anthropic API key — required for AI assistant
 network          = "testnet"      # bitcoin | testnet | signet | regtest
 ai_model         = "claude-sonnet-4-5"
 ai_send_context  = true           # set false to never send PSBT/multisig data to the AI
@@ -102,17 +123,8 @@ Environment variables override the config file:
 
 | Variable | Overrides |
 |----------|-----------|
-| `PSBT_INSPECTOR_API_KEY` | `api_key` |
 | `PSBT_INSPECTOR_NETWORK` | `network` |
 | `PSBT_INSPECTOR_AI_MODEL` | `ai_model` |
-
-If `api_key` is empty the AI assistant shows an actionable error instead of crashing.
-
-The config file may contain your API key in plaintext. **Prefer
-`PSBT_INSPECTOR_API_KEY`** so the key never touches disk. If
-`config.toml` is readable by other users (e.g. mode `644`), a startup
-warning is shown in the title bar — run `chmod 600
-~/.config/psbt-inspector/config.toml` to fix it.
 
 If `network` is set to an unrecognised value, a startup warning is shown
 and the app falls back to `testnet` (it never silently uses an
@@ -134,7 +146,7 @@ session only. Set `ai_send_context = false` to never send this context.
 ```bash
 cargo build        # compile
 cargo run          # run the TUI
-cargo test         # run all tests (82 tests)
+cargo test         # run all tests (78 tests)
 cargo clippy       # lint
 cargo fmt          # format
 ```
