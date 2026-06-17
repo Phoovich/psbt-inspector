@@ -165,7 +165,32 @@ impl AppState {
                 maybe_event = events.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            if !self.handle_key(key) {
+                            let mut should_quit = !self.handle_key(key);
+                            if !should_quit {
+                                // Drain burst: batch all events that arrive within 5 ms
+                                // so a paste of thousands of chars causes one redraw, not one
+                                // per character.
+                                'drain: loop {
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_millis(5),
+                                        events.next(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(Ok(Event::Key(k))))
+                                            if k.kind == KeyEventKind::Press =>
+                                        {
+                                            if !self.handle_key(k) {
+                                                should_quit = true;
+                                                break 'drain;
+                                            }
+                                        }
+                                        Ok(Some(Ok(Event::Resize(_, _)))) => {}
+                                        _ => break 'drain,
+                                    }
+                                }
+                            }
+                            if should_quit {
                                 break;
                             }
                             redraw = true;
@@ -395,6 +420,7 @@ impl AppState {
         if self.ai_loading {
             return;
         }
+        self.ai_question_input.clear();
 
         let psbt_ref = match &self.psbt_state {
             PsbtState::Ok(s) => Some(s),

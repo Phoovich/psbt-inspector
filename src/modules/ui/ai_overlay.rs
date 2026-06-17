@@ -61,12 +61,18 @@ pub fn draw(
         vertical: 1,
     });
     let q_width = q_inner.width as usize;
-    let q_char_count = question.chars().count();
-    let q_visible: String = if q_char_count > q_width {
-        question.chars().skip(q_char_count - q_width).collect()
+    let q_show = q_width.saturating_sub(1);
+    let q_len = question.len();
+    let tail_start = if q_len > q_show {
+        let byte_start = q_len - q_show;
+        (byte_start..=q_len)
+            .find(|&i| question.is_char_boundary(i))
+            .unwrap_or(q_len)
     } else {
-        question.to_string()
+        0
     };
+    let q_visible = &question[tail_start..];
+    let q_char_count = q_visible.chars().count(); // O(width), not O(n)
 
     let question_widget = Paragraph::new(q_visible).block(
         Block::default()
@@ -76,7 +82,7 @@ pub fn draw(
     );
     frame.render_widget(question_widget, chunks[1]);
 
-    let cursor_x = (q_inner.x + q_char_count.min(q_width) as u16).min(q_inner.x + q_inner.width);
+    let cursor_x = q_inner.x + q_char_count as u16;
     frame.set_cursor_position(Position {
         x: cursor_x,
         y: q_inner.y,

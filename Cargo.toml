@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 ratatui   = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
-tokio     = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio     = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow    = "1"
 bitcoin   = { version = "0.32", features = ["serde"] }
 base64    = "0.22"

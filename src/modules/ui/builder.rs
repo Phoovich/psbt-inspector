@@ -54,12 +54,18 @@ fn draw_pubkey_box(frame: &mut Frame, area: Rect, title: &str, text: &str, is_fo
         vertical: 1,
     });
     let width = inner.width as usize;
-    let char_count = text.chars().count();
-    let visible: String = if char_count > width {
-        text.chars().skip(char_count - width).collect()
+    let show = width.saturating_sub(1);
+    let len = text.len();
+    let tail_start = if len > show {
+        let byte_start = len - show;
+        (byte_start..=len)
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(len)
     } else {
-        text.to_string()
+        0
     };
+    let visible = &text[tail_start..];
+    let visible_chars = visible.chars().count();
 
     let p = Paragraph::new(visible).block(
         Block::default()
@@ -70,7 +76,7 @@ fn draw_pubkey_box(frame: &mut Frame, area: Rect, title: &str, text: &str, is_fo
     frame.render_widget(p, area);
 
     if is_focused {
-        let cursor_x = (inner.x + char_count.min(width) as u16).min(inner.x + inner.width);
+        let cursor_x = inner.x + visible_chars as u16;
         frame.set_cursor_position(Position {
             x: cursor_x,
             y: inner.y,

@@ -4,12 +4,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::timeout};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+// Max silence between streaming chunks before we give up.
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 const SYSTEM_PROMPT: &str = "You are an expert Bitcoin developer helping analyze PSBTs and multisig wallets. \
      Be concise and precise.";
 
@@ -32,6 +34,8 @@ pub enum AiError {
     Http(#[from] reqwest::Error),
     #[error("Unexpected response: {0}")]
     ParseResponse(String),
+    #[error("Network timed out while waiting for AI response")]
+    Timeout,
 }
 
 // ── Request types ─────────────────────────────────────────────────────────────
@@ -158,7 +162,11 @@ pub async fn ask(
 
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = timeout(CHUNK_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| AiError::Timeout)?;
+        let Some(chunk) = next else { break };
         let chunk = chunk?;
         buf.extend_from_slice(&chunk);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
