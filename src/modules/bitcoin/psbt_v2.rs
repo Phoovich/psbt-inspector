@@ -587,6 +587,143 @@ mod tests {
         assert!(matches!(err, PsbtError::Decode(_)));
     }
 
+    // ─── M1: multi-input / multi-output PSBTv2 ───────────────────────────────
+
+    /// Builds a PSBTv2 with N inputs (each using witness UTXO) and M outputs.
+    fn build_v2_psbt_multi(input_values: &[u64], output_amounts: &[u64]) -> Vec<u8> {
+        let mut buf = MAGIC.to_vec();
+
+        push_pair(&mut buf, PSBT_GLOBAL_VERSION, &2u32.to_le_bytes());
+        let mut ic = Vec::new();
+        push_compact_size(&mut ic, input_values.len() as u64);
+        push_pair(&mut buf, PSBT_GLOBAL_INPUT_COUNT, &ic);
+        let mut oc = Vec::new();
+        push_compact_size(&mut oc, output_amounts.len() as u64);
+        push_pair(&mut buf, PSBT_GLOBAL_OUTPUT_COUNT, &oc);
+        buf.push(0x00);
+
+        for (i, &v) in input_values.iter().enumerate() {
+            let txid_bytes: [u8; 32] = core::array::from_fn(|j| (i * 7 + j + 1) as u8);
+            let txid = Txid::from_byte_array(txid_bytes);
+            push_pair(&mut buf, PSBT_IN_PREVIOUS_TXID, &consensus::serialize(&txid));
+            push_pair(&mut buf, PSBT_IN_OUTPUT_INDEX, &0u32.to_le_bytes());
+            let wit_utxo = TxOut { value: Amount::from_sat(v), script_pubkey: ScriptBuf::new() };
+            push_pair(&mut buf, PSBT_IN_WITNESS_UTXO, &consensus::serialize(&wit_utxo));
+            buf.push(0x00);
+        }
+        for &a in output_amounts {
+            push_pair(&mut buf, PSBT_OUT_AMOUNT, &a.to_le_bytes());
+            push_pair(&mut buf, PSBT_OUT_SCRIPT, &[]);
+            buf.push(0x00);
+        }
+        buf
+    }
+
+    #[test]
+    fn psbtv2_multi_input_sums_values_and_fee_correctly() {
+        let bytes = build_v2_psbt_multi(&[100_000, 200_000], &[250_000]);
+        let summary = parse_psbt(&STANDARD.encode(&bytes)).unwrap();
+
+        assert_eq!(summary.input_count, 2);
+        assert_eq!(summary.output_count, 1);
+        assert_eq!(summary.inputs[0].value, Some(100_000));
+        assert_eq!(summary.inputs[1].value, Some(200_000));
+        assert!(matches!(summary.fee, FeeInfo::Known(50_000)));
+        assert_eq!(summary.signing_progress.total_inputs, 2);
+        assert_eq!(summary.signing_progress.signed_inputs, 0);
+    }
+
+    // ─── M2: witness_utxo unverifiable warning (v2 path) ─────────────────────
+
+    #[test]
+    fn psbtv2_witness_utxo_produces_unverifiable_warning() {
+        let bytes = build_minimal_v2_psbt(); // the minimal v2 uses witness UTXO
+        let summary = parse_psbt(&STANDARD.encode(&bytes)).unwrap();
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("unverifiable")),
+            "warnings: {:?}",
+            summary.warnings
+        );
+    }
+
+    // ─── M4: extract_prev_output direct units ────────────────────────────────
+
+    /// Builds the raw bytes of a legacy (non-segwit) transaction with `n_inputs`
+    /// empty inputs and one output of `output_value` sats. byte[4] = n_inputs so
+    /// `extract_prev_output` does not mistake it for a segwit marker.
+    fn legacy_tx_bytes(n_inputs: u8, output_value: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u32.to_le_bytes()); // version
+        b.push(n_inputs); // input count (compact-size, fits in 1 byte here)
+        for _ in 0..n_inputs {
+            b.extend_from_slice(&[0u8; 32]); // prev txid (zeros)
+            b.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prev vout
+            b.push(0x00); // scriptSig len = 0
+            b.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // sequence
+        }
+        b.push(0x01); // output count = 1
+        b.extend_from_slice(&output_value.to_le_bytes());
+        b.push(0x00); // scriptPubKey len = 0
+        b.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        b
+    }
+
+    #[test]
+    fn extract_prev_output_returns_correct_value_for_vout_0() {
+        let bytes = legacy_tx_bytes(1, 99_999);
+        let (value, script) = extract_prev_output(&bytes, 0).unwrap();
+        assert_eq!(value, 99_999);
+        assert!(script.is_empty());
+    }
+
+    #[test]
+    fn extract_prev_output_returns_none_for_out_of_range_vout() {
+        let bytes = legacy_tx_bytes(1, 100_000);
+        assert!(extract_prev_output(&bytes, 1).is_none());
+    }
+
+    #[test]
+    fn extract_prev_output_returns_none_for_truncated_data() {
+        let bytes = legacy_tx_bytes(1, 100_000);
+        assert!(extract_prev_output(&bytes[..bytes.len() / 2], 0).is_none());
+    }
+
+    #[test]
+    fn extract_prev_output_skips_multiple_inputs() {
+        let bytes = legacy_tx_bytes(3, 55_555);
+        let (value, _) = extract_prev_output(&bytes, 0).unwrap();
+        assert_eq!(value, 55_555);
+    }
+
+    // ─── L3: read_compact_size — all four encodings ───────────────────────────
+
+    #[test]
+    fn compact_size_single_byte() {
+        let bytes = [0x07u8];
+        assert_eq!(Cursor::new(&bytes).read_compact_size().unwrap(), 7);
+    }
+
+    #[test]
+    fn compact_size_two_byte_fd_prefix() {
+        let mut b = vec![0xfdu8];
+        b.extend_from_slice(&1000u16.to_le_bytes());
+        assert_eq!(Cursor::new(&b).read_compact_size().unwrap(), 1000);
+    }
+
+    #[test]
+    fn compact_size_four_byte_fe_prefix() {
+        let mut b = vec![0xfeu8];
+        b.extend_from_slice(&100_000u32.to_le_bytes());
+        assert_eq!(Cursor::new(&b).read_compact_size().unwrap(), 100_000);
+    }
+
+    #[test]
+    fn compact_size_eight_byte_ff_prefix() {
+        let mut b = vec![0xffu8];
+        b.extend_from_slice(&10_000_000_000u64.to_le_bytes());
+        assert_eq!(Cursor::new(&b).read_compact_size().unwrap(), 10_000_000_000);
+    }
+
     /// Real-world PSBTv2 whose input carries `PSBT_IN_NON_WITNESS_UTXO`
     /// (no `PSBT_IN_WITNESS_UTXO`), with a finalized scriptSig signature.
     /// The embedded previous transaction has a segwit marker/flag but an

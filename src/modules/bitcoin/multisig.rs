@@ -197,6 +197,22 @@ mod tests {
         assert_ne!(sorted.address, unsorted.address);
     }
 
+    // ─── L4: keys_were_sorted flag value ─────────────────────────────────────
+
+    #[test]
+    fn keys_were_sorted_true_when_input_order_is_reversed() {
+        // PK2 > PK1 lexicographically; giving (PK2, PK1) with sort=true triggers a swap.
+        let info = build_multisig(PK2, PK1, Network::Testnet, true).unwrap();
+        assert!(info.keys_were_sorted);
+    }
+
+    #[test]
+    fn keys_were_sorted_false_when_already_in_order() {
+        // PK1 < PK2; giving (PK1, PK2) with sort=true needs no swap.
+        let info = build_multisig(PK1, PK2, Network::Testnet, true).unwrap();
+        assert!(!info.keys_were_sorted);
+    }
+
     #[test]
     fn witness_script_hex_is_non_empty() {
         let info = build_multisig(PK1, PK2, Network::Testnet, true).unwrap();

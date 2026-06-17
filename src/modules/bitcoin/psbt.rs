@@ -526,6 +526,105 @@ mod tests {
         );
     }
 
+    // ─── M2: witness_utxo unverifiable warning (v0 path) ─────────────────────
+
+    #[test]
+    fn v0_witness_utxo_produces_unverifiable_warning() {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        let summary = parse_psbt(&STANDARD.encode(psbt.serialize())).unwrap();
+        assert_eq!(summary.inputs[0].value, Some(100_000));
+        assert!(
+            summary.warnings.iter().any(|w| w.contains("unverifiable")),
+            "warnings: {:?}",
+            summary.warnings
+        );
+    }
+
+    // ─── M5: hex-encoded PSBT ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_psbt_accepts_hex_encoded_input() {
+        let b64 = make_psbt_no_utxo();
+        let bytes = STANDARD.decode(&b64).unwrap();
+        let summary = parse_psbt(&hex::encode(&bytes)).unwrap();
+        assert_eq!(summary.input_count, 1);
+        assert_eq!(summary.output_count, 1);
+    }
+
+    // ─── L2: script_type_from_script — all standard types ────────────────────
+
+    fn raw_script(bytes: &[u8]) -> ScriptBuf {
+        ScriptBuf::from(bytes.to_vec())
+    }
+
+    #[test]
+    fn script_type_detects_p2pkh() {
+        // OP_DUP OP_HASH160 PUSH_20 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+        let mut b = vec![0x76u8, 0xa9, 0x14];
+        b.extend_from_slice(&[0u8; 20]);
+        b.extend_from_slice(&[0x88, 0xac]);
+        assert_eq!(script_type_from_script(&raw_script(&b)), ScriptType::P2PKH);
+    }
+
+    #[test]
+    fn script_type_detects_p2sh() {
+        // OP_HASH160 PUSH_20 <20 bytes> OP_EQUAL
+        let mut b = vec![0xa9u8, 0x14];
+        b.extend_from_slice(&[0u8; 20]);
+        b.push(0x87);
+        assert_eq!(script_type_from_script(&raw_script(&b)), ScriptType::P2SH);
+    }
+
+    #[test]
+    fn script_type_detects_p2wpkh() {
+        // OP_0 PUSH_20 <20 bytes>
+        let mut b = vec![0x00u8, 0x14];
+        b.extend_from_slice(&[0u8; 20]);
+        assert_eq!(script_type_from_script(&raw_script(&b)), ScriptType::P2WPKH);
+    }
+
+    #[test]
+    fn script_type_detects_p2wsh() {
+        // OP_0 PUSH_32 <32 bytes>
+        let mut b = vec![0x00u8, 0x20];
+        b.extend_from_slice(&[0u8; 32]);
+        assert_eq!(script_type_from_script(&raw_script(&b)), ScriptType::P2WSH);
+    }
+
+    #[test]
+    fn script_type_detects_p2tr() {
+        // OP_PUSHNUM_1 PUSH_32 <32 bytes>
+        let mut b = vec![0x51u8, 0x20];
+        b.extend_from_slice(&[0u8; 32]);
+        assert_eq!(script_type_from_script(&raw_script(&b)), ScriptType::P2TR);
+    }
+
+    #[test]
+    fn script_type_detects_unknown() {
+        assert_eq!(
+            script_type_from_script(&ScriptBuf::new()),
+            ScriptType::Unknown
+        );
+    }
+
     // ─── S4: outputs exceeding inputs ─────────────────────────────────────────
 
     #[test]
